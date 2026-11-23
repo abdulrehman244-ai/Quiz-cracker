@@ -15,6 +15,7 @@ import time
 import threading
 import webbrowser
 import ctypes
+from ctypes import wintypes
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -23,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk
 
 import mss
-from PIL import Image
+from PIL import Image, ImageGrab
 
 from ai_providers import (
     PROVIDERS,
@@ -210,6 +211,25 @@ def get_screen_bounds_at(x: int, y: int) -> tuple:
         return get_work_area()
 
 
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+_kernel32.CreateMutexW.restype = wintypes.HANDLE
+_kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+_kernel32.CreateEventW.restype = wintypes.HANDLE
+_kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+_kernel32.SetEvent.restype = wintypes.BOOL
+_kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_kernel32.WaitForSingleObject.restype = wintypes.DWORD
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_user32.GetParent.argtypes = [wintypes.HWND]
+_user32.GetParent.restype = wintypes.HWND
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_user32.SetForegroundWindow.restype = wintypes.BOOL
+
+
 def apply_win32_overlay_style(tk_window: tk.Tk):
     """
     Configure native Windows overlay flags:
@@ -219,24 +239,22 @@ def apply_win32_overlay_style(tk_window: tk.Tk):
     """
     try:
         tk_window.update_idletasks()
-        hwnd = ctypes.windll.user32.GetParent(tk_window.winfo_id())
-        if not hwnd:
-            hwnd = tk_window.winfo_id()
+        hwnd = _user32.GetParent(tk_window.winfo_id()) or tk_window.winfo_id()
 
         GWL_EXSTYLE = -20
         WS_EX_TOOLWINDOW = 0x00000080
         WS_EX_NOACTIVATE = 0x08000000
         WS_EX_APPWINDOW = 0x00040000
 
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         style = (style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW
-        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
 
         # Windows 11 rounded corners (safe no-op on Windows 10)
         DWMWA_WINDOW_CORNER_PREFERENCE = 33
         DWMWCP_ROUND = ctypes.c_int(2)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd,
+            wintypes.HWND(hwnd),
             DWMWA_WINDOW_CORNER_PREFERENCE,
             ctypes.byref(DWMWCP_ROUND),
             ctypes.sizeof(DWMWCP_ROUND),
@@ -249,19 +267,20 @@ def make_normal_activatable_dialog(win: tk.Toplevel):
     """Ensure Settings dialog is a normal, focusable taskbar window."""
     try:
         win.update_idletasks()
-        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
-        if not hwnd:
-            hwnd = win.winfo_id()
+        hwnd = _user32.GetParent(win.winfo_id()) or win.winfo_id()
 
         GWL_EXSTYLE = -20
         WS_EX_TOOLWINDOW = 0x00000080
         WS_EX_NOACTIVATE = 0x08000000
         WS_EX_APPWINDOW = 0x00040000
 
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         style = (style | WS_EX_APPWINDOW) & ~WS_EX_NOACTIVATE & ~WS_EX_TOOLWINDOW
-        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        win.attributes("-topmost", True)
+        win.lift()
+        _user32.SetForegroundWindow(hwnd)
+        win.after(150, lambda: win.winfo_exists() and win.attributes("-topmost", False))
     except Exception:
         pass
 
@@ -296,16 +315,16 @@ def acquire_single_instance():
     """
     try:
         ERROR_ALREADY_EXISTS = 183
-        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
-        already = ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS
-        wakeup_evt = ctypes.windll.kernel32.CreateEventW(None, False, False, WAKEUP_EVENT_NAME)
+        mutex = _kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        already = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+        wakeup_evt = _kernel32.CreateEventW(None, False, False, WAKEUP_EVENT_NAME)
 
         if already:
             if wakeup_evt:
-                ctypes.windll.kernel32.SetEvent(wakeup_evt)
-                ctypes.windll.kernel32.CloseHandle(wakeup_evt)
+                _kernel32.SetEvent(wakeup_evt)
+                _kernel32.CloseHandle(wakeup_evt)
             if mutex:
-                ctypes.windll.kernel32.CloseHandle(mutex)
+                _kernel32.CloseHandle(mutex)
             return None, None
         return mutex, wakeup_evt
     except Exception:
@@ -317,7 +336,7 @@ def poll_wakeup_event(wakeup_evt) -> bool:
     if not wakeup_evt or wakeup_evt is True:
         return False
     try:
-        return ctypes.windll.kernel32.WaitForSingleObject(wakeup_evt, 0) == 0
+        return _kernel32.WaitForSingleObject(wakeup_evt, 0) == 0
     except Exception:
         return False
 
@@ -477,23 +496,40 @@ def encode_pil_to_jpeg(img: Image.Image, max_width: int = 1920, quality: int = 8
 def capture_monitor_at_cursor() -> bytes:
     """Capture the full display where the mouse cursor currently is."""
     cx, cy = get_cursor_pos()
-    with _open_mss() as sct:
-        target = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-        for mon in sct.monitors[1:]:
-            if (mon["left"] <= cx < mon["left"] + mon["width"] and
-                    mon["top"] <= cy < mon["top"] + mon["height"]):
-                target = mon
-                break
-        shot = sct.grab(target)
-        img = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+    target = None
+    try:
+        with _open_mss() as sct:
+            target = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            for mon in sct.monitors[1:]:
+                if (mon["left"] <= cx < mon["left"] + mon["width"] and
+                        mon["top"] <= cy < mon["top"] + mon["height"]):
+                    target = mon
+                    break
+            shot = sct.grab(target)
+            img = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+            return encode_pil_to_jpeg(img)
+    except Exception:
+        bbox = None
+        if target:
+            bbox = (
+                target["left"],
+                target["top"],
+                target["left"] + target["width"],
+                target["top"] + target["height"],
+            )
+        img = ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
         return encode_pil_to_jpeg(img)
 
 
 def capture_region(x: int, y: int, w: int, h: int) -> bytes:
     """Capture a specific rectangular region in global screen coordinates."""
-    with _open_mss() as sct:
-        shot = sct.grab({"left": x, "top": y, "width": w, "height": h})
-        img = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+    try:
+        with _open_mss() as sct:
+            shot = sct.grab({"left": x, "top": y, "width": w, "height": h})
+            img = Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+            return encode_pil_to_jpeg(img)
+    except Exception:
+        img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True).convert("RGB")
         return encode_pil_to_jpeg(img)
 
 
@@ -1222,7 +1258,7 @@ class QuizCrackerApp:
         # Start mouse-move polling loop (30ms = 33Hz)
         self.root.after(30, self._poll_mouse)
 
-        # Open API Key & Settings on first run if no key yet
+        # Open API Key & Settings on first run if no key yet; otherwise show brief Ready pill
         self.root.after(450, self._check_first_run)
 
     # ───────────────────────────────────────────────────
@@ -1802,6 +1838,25 @@ class QuizCrackerApp:
     def _check_first_run(self):
         if not ConfigManager.has_valid_setup():
             self._open_settings()
+        else:
+            self._show_startup_ready_hint()
+
+    def _show_startup_ready_hint(self):
+        if self.mode != "idle" or self.is_hovered or self.is_paused:
+            return
+        self.idle_lbl.configure(text="Ready • Wiggle")
+        self.idle_lbl.pack(side=tk.LEFT)
+        self.root.attributes("-alpha", 0.72)
+        self._anchor_to_corner()
+        self.root.after(3500, self._hide_startup_ready_hint)
+
+    def _hide_startup_ready_hint(self):
+        if self.mode == "idle" and not self.is_hovered and not self.is_paused:
+            self._update_idle_indicator()
+            if ConfigManager.get("idle_style", "dot") == "dot":
+                self.idle_lbl.pack_forget()
+            self._update_alpha()
+            self._anchor_to_corner()
 
     def _open_settings(self):
         if self._settings_win is not None and self._settings_win.winfo_exists():
@@ -1853,7 +1908,7 @@ def main():
         for h in (mutex, wakeup_evt):
             if isinstance(h, int) and h:
                 try:
-                    ctypes.windll.kernel32.CloseHandle(h)
+                    _kernel32.CloseHandle(h)
                 except Exception:
                     pass
 
